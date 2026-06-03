@@ -1,7 +1,26 @@
-"""Native chat stream support for Slack with graceful fallback."""
+"""Native chat stream support for Slack with graceful fallback.
+
+Rendering model
+---------------
+Each agent turn is rendered as one or more Slack *plan cards* (one streamed
+message each, ``task_display_mode="plan"``). A card holds task rows:
+
+* ``analyze`` — folds the streamed reasoning into its ``details`` (option A:
+  thinking never reaches the message body, only the freshest tail window).
+* one row per tool call — the full tool-call record, each with its own ✓.
+* ``respond`` — drafting the final answer; the answer text streams into the
+  body of the card that is active when the answer starts.
+
+When a card fills up (``_MAX_TOOLS_PER_CARD`` tool rows, kept safely under
+Slack's per-plan task cap) the next tool call rolls onto a fresh plan card —
+so the complete history stays visible across multiple cards, never one card
+per tool. A very long answer body (Slack caps ``markdown_text`` at 12k) rolls
+onto a plain continuation message.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -17,12 +36,28 @@ _MAX_TOOL_HISTORY = 8
 _PLAN_TITLE = "Working on your request"
 _ANALYZE_TASK_ID = "analyze"
 _ANALYZE_TASK_TITLE = "Understand request"
-_TOOLS_TASK_ID = "tools"
-_TOOLS_TASK_TITLE = "Use tools if needed"
-_RESPONSE_TASK_ID = "respond"
-_RESPONSE_TASK_TITLE = "Draft response"
-_NO_TOOLS_DETAIL = "No tools needed"
+_RESPOND_TASK_ID = "respond"
+_RESPOND_TASK_TITLE = "Draft response"
+_TITLE_LIMIT = 140
 _DETAIL_LIMIT = 280
+# Slack rejects a streamed message once its rendered markdown grows past a hard
+# length cap (`msg_too_long`); the SDK documents the limit as 12,000 chars. We
+# roll to a fresh continuation message before reaching it.
+_MAX_STREAM_CHARS = 11000
+# Slack rejects a plan whose `tasks` array exceeds 50 entries. We paginate tool
+# rows well under that (leaving room for analyze/respond) and roll to a new
+# plan card when a card fills up.
+_MAX_TOOLS_PER_CARD = 45
+_CONTINUATION_HEADER = "_(continued)_\n\n"
+# A single write is retried this many times across recoverable failures
+# (length roll, dead-stream roll, rate-limit backoff) before giving up.
+_MAX_STREAM_WRITE_ATTEMPTS = 3
+# Recoverable by rolling onto a new stream message rather than degrading.
+# - msg_too_long: current message is still alive; stop it cleanly, continue in a new one.
+# - message_not_in_streaming_state: current message is already dead; discard and reopen.
+_ROLLABLE_ERRORS = frozenset({"msg_too_long", "message_not_in_streaming_state"})
+# Recoverable by backing off and retrying the same stream.
+_RATELIMIT_ERRORS = frozenset({"ratelimited", "rate_limited"})
 _SYSTEM_LABELS: dict[str, str] = {
     "thinking": "Thinking",
     "compacting": "Compacting",
@@ -30,14 +65,6 @@ _SYSTEM_LABELS: dict[str, str] = {
     "timeout_warning": "Timeout approaching",
     "timeout_extended": "Timeout extended",
 }
-
-
-@dataclass(slots=True)
-class _PlanTaskState:
-    id: str
-    title: str
-    status: str = "pending"
-    details: str = ""
 
 
 @dataclass(slots=True)
@@ -70,89 +97,97 @@ class SlackStreamEditor:
         self._thinking_parts: list[str] = []
         self._answer_parts: list[str] = []
         self._status: str | None = None
-        self._thinking_started = False
         self._answer_started = False
+        self._answer_phase = False
         self._tool_history: list[_ToolActivity] = []
+        self._tool_count = 0
         self._used_tools = False
-        self._plan_started = False
-        self._plan_tasks = {
-            _ANALYZE_TASK_ID: _PlanTaskState(_ANALYZE_TASK_ID, _ANALYZE_TASK_TITLE),
-            _TOOLS_TASK_ID: _PlanTaskState(_TOOLS_TASK_ID, _TOOLS_TASK_TITLE),
-            _RESPONSE_TASK_ID: _PlanTaskState(_RESPONSE_TASK_ID, _RESPONSE_TASK_TITLE),
-        }
+        # --- plan-card state ---
+        self._card_started = False  # card 0 (analyze) has been emitted
+        self._card_is_plan = True  # current card renders a plan block (vs plain text)
+        self._card_plan_emitted = False  # plan_update header sent on the current card
+        self._analyze_done = False
+        self._analyze_detail_sent = ""
+        self._respond_started = False
+        self._tool_seq = 0  # global, for stable per-tool task ids
+        self._tools_on_card = 0
+        self._active_tool_id: str | None = None
+        self._active_tool_title = ""
+        # --- stream length / rolling state ---
+        self._stream_chars = 0  # markdown chars written to the current message
+        self._rolled = False
+        self._pending_continuation_header = False
+
+    # ------------------------------------------------------------------ events
 
     async def on_thinking(self, text: str) -> None:
-        """Append streamed reasoning text."""
+        """Record reasoning and surface it in the analyze task, not the message body."""
         if not text.strip():
             return
         self._thinking_parts.append(text)
         self._status = "thinking"
-        await self._ensure_plan_started(
-            phase=_ANALYZE_TASK_ID,
-            analysis_detail=self._thinking_detail(text),
-        )
-        prefix = "💭 *Thinking*\n" if not self._thinking_started else ""
-        self._thinking_started = True
-        await self._append_markdown(prefix + text)
-
-    async def on_delta(self, text: str) -> None:
-        """Append assistant answer text."""
-        if not text:
+        await self._ensure_card0()
+        if self._analyze_done:
             return
-        await self._ensure_plan_started(phase=_RESPONSE_TASK_ID)
-        plan_updates: list[dict[str, object]] = []
-        analyze_chunk = self._set_task(
-            _ANALYZE_TASK_ID,
-            status="complete",
-            details=self._analysis_detail(),
-        )
-        if analyze_chunk is not None:
-            plan_updates.append(analyze_chunk)
-        tools_chunk = self._set_task(
-            _TOOLS_TASK_ID,
-            status="complete",
-            details=self._tool_details() if self._used_tools else _NO_TOOLS_DETAIL,
-        )
-        if tools_chunk is not None:
-            plan_updates.append(tools_chunk)
-        response_chunk = self._set_task(_RESPONSE_TASK_ID, status="in_progress")
-        if response_chunk is not None:
-            plan_updates.append(response_chunk)
-        await self._append_chunks(plan_updates)
-        self._answer_parts.append(text)
-        prefix = ""
-        if not self._answer_started:
-            prefix = "\n\n" if self._thinking_started else ""
-            self._answer_started = True
-        await self._append_markdown(prefix + text)
+        detail = self._analysis_detail()
+        if detail == self._analyze_detail_sent:
+            return
+        self._analyze_detail_sent = detail
+        await self._emit([self._task(_ANALYZE_TASK_ID, _ANALYZE_TASK_TITLE, "in_progress", detail)])
 
     async def on_tool(self, tool: ToolUseEvent | str) -> None:
-        """Show tool activity using Slack's plan UI."""
+        """Render each tool call as its own task row (paginating across cards)."""
         activity = self._tool_activity(tool)
-        if activity.target:
-            self._thinking_parts.append(f"\n[TOOL: {activity.label}: {activity.target}]\n")
-        else:
-            self._thinking_parts.append(f"\n[TOOL: {activity.label}]\n")
         self._tool_history.append(activity)
         self._tool_history = self._tool_history[-_MAX_TOOL_HISTORY:]
+        self._tool_count += 1
         self._used_tools = True
-        await self._ensure_plan_started(phase=_TOOLS_TASK_ID)
-        chunks: list[dict[str, object]] = []
-        analyze_chunk = self._set_task(
-            _ANALYZE_TASK_ID,
-            status="complete",
-            details=self._analysis_detail(),
-        )
-        if analyze_chunk is not None:
-            chunks.append(analyze_chunk)
-        tools_chunk = self._set_task(
-            _TOOLS_TASK_ID,
-            status="in_progress",
-            details=self._tool_details(),
-        )
-        if tools_chunk is not None:
-            chunks.append(tools_chunk)
-        await self._append_chunks(chunks)
+        await self._ensure_card0()
+
+        batch: list[dict[str, object]] = []
+        if not self._analyze_done:
+            self._analyze_done = True
+            batch.append(self._task(_ANALYZE_TASK_ID, _ANALYZE_TASK_TITLE, "complete", self._analysis_detail()))
+        if self._active_tool_id is not None:
+            batch.append(self._task(self._active_tool_id, self._active_tool_title, "complete"))
+            self._active_tool_id = None
+
+        # Paginate: a full card flushes its pending completions, then rolls.
+        if self._tools_on_card >= _MAX_TOOLS_PER_CARD:
+            await self._emit(batch)
+            batch = []
+            await self._open_new_card()
+
+        self._tool_seq += 1
+        task_id = f"tool-{self._tool_seq}"
+        title = self._tool_title(activity)
+        self._active_tool_id = task_id
+        self._active_tool_title = title
+        self._tools_on_card += 1
+        batch.append(self._task(task_id, title, "in_progress"))
+        await self._emit(batch)
+
+    async def on_delta(self, text: str) -> None:
+        """Stream assistant answer text into the message body."""
+        if not text:
+            return
+        await self._ensure_card0()
+        self._answer_phase = True
+        batch: list[dict[str, object]] = []
+        if not self._analyze_done:
+            self._analyze_done = True
+            batch.append(self._task(_ANALYZE_TASK_ID, _ANALYZE_TASK_TITLE, "complete", self._analysis_detail()))
+        if self._active_tool_id is not None:
+            batch.append(self._task(self._active_tool_id, self._active_tool_title, "complete"))
+            self._active_tool_id = None
+        if not self._respond_started:
+            self._respond_started = True
+            batch.append(self._task(_RESPOND_TASK_ID, _RESPOND_TASK_TITLE, "in_progress"))
+        await self._emit(batch)
+
+        self._answer_parts.append(text)
+        self._answer_started = True
+        await self._append_markdown(text)
 
     async def on_system(self, status: str | None) -> None:
         """Track transient system status."""
@@ -168,40 +203,202 @@ class SlackStreamEditor:
         if final_text and not "".join(self._answer_parts).strip():
             self._answer_parts = [final_text]
         if self._native_failed:
-            rendered = self._render_fallback(final_text)
-            if rendered:
-                await send_rich(
-                    self._client,
-                    self._channel_id,
-                    rendered,
-                    SlackSendOpts(thread_ts=self._thread_ts),
-                )
+            await self._send_fallback(final_text)
             return
 
-        stream = await self._ensure_stream()
         stop_text = None
         if final_text and not self._answer_started:
             stop_text = final_text
-        stop_chunks = self._final_plan_chunks(final_text)
-        await stream.stop(markdown_text=stop_text, chunks=stop_chunks)
+        if stop_text and self._pending_continuation_header:
+            stop_text = _CONTINUATION_HEADER + stop_text
+            self._pending_continuation_header = False
+        stop_chunks = self._finalize_plan_chunks(bool(final_text))
+        try:
+            stream = await self._ensure_stream()
+            await stream.stop(markdown_text=stop_text, chunks=stop_chunks)
+        except Exception as exc:
+            self._mark_native_failure(exc)
+            await self._send_fallback(final_text)
+
+    # ------------------------------------------------------------- plan chunks
+
+    async def _ensure_card0(self) -> None:
+        """Emit the first plan card (analyze in progress) on first activity."""
+        if self._card_started:
+            return
+        self._card_started = True
+        self._analyze_detail_sent = self._analysis_detail()
+        await self._emit(
+            [self._task(_ANALYZE_TASK_ID, _ANALYZE_TASK_TITLE, "in_progress", self._analyze_detail_sent)]
+        )
+
+    async def _open_new_card(self) -> None:
+        """Roll onto a fresh plan card to continue the tool-call record."""
+        await self._roll_stream(stop_current=True)
+
+    async def _emit(self, chunks: list[dict[str, object]]) -> None:
+        """Send plan/task chunks to the current card, prepending the plan header once."""
+        if not chunks or not self._card_is_plan:
+            return
+        out: list[dict[str, object]] = []
+        if not self._card_plan_emitted:
+            out.append({"type": "plan_update", "title": _PLAN_TITLE})
+            self._card_plan_emitted = True
+        out.extend(chunks)
+        await self._append_chunks(out)
+
+    def _finalize_plan_chunks(self, has_final_text: bool) -> list[dict[str, object]] | None:
+        """Chunks to mark the current card's tasks complete on stop()."""
+        if not self._card_started or not self._card_is_plan:
+            return None
+        chunks: list[dict[str, object]] = []
+        if not self._card_plan_emitted:
+            self._card_plan_emitted = True
+            chunks.append({"type": "plan_update", "title": _PLAN_TITLE})
+        if not self._analyze_done:
+            self._analyze_done = True
+            chunks.append(self._task(_ANALYZE_TASK_ID, _ANALYZE_TASK_TITLE, "complete", self._analysis_detail()))
+        if self._active_tool_id is not None:
+            chunks.append(self._task(self._active_tool_id, self._active_tool_title, "complete"))
+            self._active_tool_id = None
+        if self._answer_started or self._respond_started or has_final_text:
+            chunks.append(self._task(_RESPOND_TASK_ID, _RESPOND_TASK_TITLE, "complete"))
+        return chunks or None
+
+    def _task(
+        self,
+        task_id: str,
+        title: str,
+        status: str,
+        details: str | None = None,
+    ) -> dict[str, object]:
+        chunk: dict[str, object] = {
+            "type": "task_update",
+            "id": task_id,
+            "title": self._limit_title(title),
+            "status": status,
+        }
+        if details:
+            chunk["details"] = self._limit_detail(details)
+        return chunk
+
+    def _tool_title(self, activity: _ToolActivity) -> str:
+        if activity.target:
+            return f"{activity.label}: {activity.target}"
+        return activity.label
+
+    # --------------------------------------------------------------- transport
 
     async def _append_markdown(self, text: str) -> None:
         if not text or self._native_failed:
             return
-        try:
-            stream = await self._ensure_stream()
-            await stream.append(markdown_text=text)
-        except Exception as exc:
-            self._mark_native_failure(exc)
+        await self._write(markdown_text=text, account_len=len(text))
 
     async def _append_chunks(self, chunks: list[dict[str, object]]) -> None:
         if not chunks or self._native_failed:
             return
-        try:
-            stream = await self._ensure_stream()
-            await stream.append(chunks=chunks)
-        except Exception as exc:
-            self._mark_native_failure(exc)
+        await self._write(chunks=chunks)
+
+    async def _write(
+        self,
+        *,
+        markdown_text: str | None = None,
+        chunks: list[dict[str, object]] | None = None,
+        account_len: int = 0,
+    ) -> None:
+        """Append to the native stream, rolling or backing off on recoverable errors."""
+        for attempt in range(_MAX_STREAM_WRITE_ATTEMPTS):
+            # Proactively roll before we would exceed Slack's per-message cap.
+            if (
+                account_len
+                and self._stream is not None
+                and self._stream_chars + account_len > _MAX_STREAM_CHARS
+            ):
+                await self._roll_stream(stop_current=True)
+            try:
+                stream = await self._ensure_stream()
+                if markdown_text is not None:
+                    payload = markdown_text
+                    if self._pending_continuation_header:
+                        payload = _CONTINUATION_HEADER + markdown_text
+                    await stream.append(markdown_text=payload)
+                    self._pending_continuation_header = False
+                if chunks is not None:
+                    await stream.append(chunks=chunks)
+            except Exception as exc:
+                if not await self._handle_write_error(exc, attempt):
+                    return
+            else:
+                self._stream_chars += account_len
+                return
+        self._mark_native_failure(RuntimeError("Slack stream write retries exhausted"))
+
+    async def _handle_write_error(self, exc: Exception, attempt: int) -> bool:
+        """Return True if the caller should retry the write, False if handled terminally."""
+        code = self._slack_error_code(exc)
+        is_last = attempt >= _MAX_STREAM_WRITE_ATTEMPTS - 1
+        if code in _ROLLABLE_ERRORS and not is_last:
+            # msg_too_long → message is still alive, stop it cleanly before reopening.
+            # message_not_in_streaming_state → message is dead, discard without stopping.
+            await self._roll_stream(stop_current=(code == "msg_too_long"))
+            logger.info("Slack stream rolled after %s (attempt %d)", code, attempt + 1)
+            return True
+        if code in _RATELIMIT_ERRORS and not is_last:
+            await asyncio.sleep(self._retry_after(exc))
+            logger.info("Slack stream rate-limited; backed off (attempt %d)", attempt + 1)
+            return True
+        self._mark_native_failure(exc)
+        return False
+
+    async def _roll_stream(self, *, stop_current: bool) -> None:
+        """Finalize/discard the current stream and arm a fresh continuation card.
+
+        During the answer phase the continuation is a plain text message; during
+        the analyze/tool phase it is a fresh plan card so the tool record keeps
+        rendering across cards.
+        """
+        old = self._stream
+        self._stream = None
+        self._stream_chars = 0
+        self._rolled = True
+        self._tools_on_card = 0
+        self._card_plan_emitted = False
+        self._card_is_plan = not self._answer_phase
+        self._pending_continuation_header = self._answer_phase
+        if old is not None and stop_current:
+            try:
+                await old.stop()
+            except Exception as exc:
+                logger.debug("Ignored error stopping rolled Slack stream: %r", exc)
+
+    @staticmethod
+    def _slack_error_code(exc: Exception) -> str:
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            try:
+                err = resp.get("error")
+            except Exception:
+                err = None
+            if err:
+                return str(err)
+        text = str(exc)
+        for code in (*_ROLLABLE_ERRORS, *_RATELIMIT_ERRORS):
+            if code in text:
+                return code
+        return ""
+
+    @staticmethod
+    def _retry_after(exc: Exception) -> float:
+        resp = getattr(exc, "response", None)
+        headers = getattr(resp, "headers", None) if resp is not None else None
+        if isinstance(headers, dict):
+            value = headers.get("Retry-After") or headers.get("retry-after")
+            if value:
+                try:
+                    return min(float(value), 30.0)
+                except (TypeError, ValueError):
+                    pass
+        return 1.0
 
     async def _ensure_stream(self) -> Any:
         if self._stream is not None:
@@ -209,9 +406,12 @@ class SlackStreamEditor:
         kwargs: dict[str, object] = {
             "channel": self._channel_id,
             "thread_ts": self._thread_ts,
-            "task_display_mode": "plan",
             "buffer_size": _STREAM_BUFFER_SIZE,
         }
+        # Use plan mode only for cards that actually carry a plan block; plain
+        # continuation messages (long-answer overflow) and no-activity turns omit it.
+        if self._card_is_plan and self._card_started:
+            kwargs["task_display_mode"] = "plan"
         if self._recipient_team_id is not None:
             kwargs["recipient_team_id"] = self._recipient_team_id
         if self._recipient_user_id is not None:
@@ -225,75 +425,13 @@ class SlackStreamEditor:
         self._native_failed = True
         logger.warning("Slack native stream failed; falling back to plain reply: %r", exc)
 
-    async def _ensure_plan_started(
-        self,
-        *,
-        phase: str,
-        analysis_detail: str = "",
-    ) -> None:
-        if self._plan_started:
-            return
-        chunks: list[dict[str, object]] = [{"type": "plan_update", "title": _PLAN_TITLE}]
-        if phase == _ANALYZE_TASK_ID:
-            self._plan_tasks[_ANALYZE_TASK_ID].status = "in_progress"
-            self._plan_tasks[_ANALYZE_TASK_ID].details = analysis_detail
-        elif phase == _TOOLS_TASK_ID:
-            self._plan_tasks[_ANALYZE_TASK_ID].status = "complete"
-            self._plan_tasks[_ANALYZE_TASK_ID].details = self._analysis_detail()
-            self._plan_tasks[_TOOLS_TASK_ID].status = "in_progress"
-            self._plan_tasks[_TOOLS_TASK_ID].details = self._tool_details()
-        elif phase == _RESPONSE_TASK_ID:
-            self._plan_tasks[_ANALYZE_TASK_ID].status = "complete"
-            self._plan_tasks[_ANALYZE_TASK_ID].details = self._analysis_detail()
-            self._plan_tasks[_TOOLS_TASK_ID].status = "complete"
-            self._plan_tasks[_TOOLS_TASK_ID].details = (
-                self._tool_details() if self._used_tools else _NO_TOOLS_DETAIL
-            )
-            self._plan_tasks[_RESPONSE_TASK_ID].status = "in_progress"
-        chunks.extend(
-            self._task_chunk(self._plan_tasks[task_id])
-            for task_id in (_ANALYZE_TASK_ID, _TOOLS_TASK_ID, _RESPONSE_TASK_ID)
-        )
-        self._plan_started = True
-        await self._append_chunks(chunks)
-
-    def _set_task(
-        self,
-        task_id: str,
-        *,
-        status: str | None = None,
-        details: str | None = None,
-    ) -> dict[str, object] | None:
-        task = self._plan_tasks[task_id]
-        next_status = status or task.status
-        next_details = task.details if details is None else self._limit_detail(details)
-        if task.status == next_status and task.details == next_details:
-            return None
-        task.status = next_status
-        task.details = next_details
-        return self._task_chunk(task)
-
-    def _task_chunk(self, task: _PlanTaskState) -> dict[str, object]:
-        chunk: dict[str, object] = {
-            "type": "task_update",
-            "id": task.id,
-            "title": task.title,
-            "status": task.status,
-        }
-        if task.details:
-            chunk["details"] = task.details
-        return chunk
+    # ---------------------------------------------------------------- detail/text
 
     def _analysis_detail(self) -> str:
-        for part in self._thinking_parts:
-            detail = self._thinking_detail(part)
-            if detail:
-                return detail
-        return "Understanding the request"
-
-    def _thinking_detail(self, text: str) -> str:
-        cleaned = " ".join(text.split())
-        return self._limit_detail(cleaned)
+        joined = " ".join("".join(self._thinking_parts).split())
+        if not joined:
+            return "Understanding the request"
+        return self._limit_detail_tail(joined)
 
     def _tool_activity(self, tool: ToolUseEvent | str) -> _ToolActivity:
         label = normalize_tool_name(str(getattr(tool, "tool_name", tool)))
@@ -360,34 +498,34 @@ class SlackStreamEditor:
             return f"- {label}: {activity.target}"
         return f"- {label}"
 
-    def _final_plan_chunks(self, final_text: str | None) -> list[dict[str, object]] | None:
-        if not self._plan_started:
-            return None
-        chunks: list[dict[str, object]] = []
-        analyze_chunk = self._set_task(
-            _ANALYZE_TASK_ID,
-            status="complete",
-            details=self._analysis_detail(),
-        )
-        if analyze_chunk is not None:
-            chunks.append(analyze_chunk)
-        tools_chunk = self._set_task(
-            _TOOLS_TASK_ID,
-            status="complete",
-            details=self._tool_details() if self._used_tools else _NO_TOOLS_DETAIL,
-        )
-        if tools_chunk is not None:
-            chunks.append(tools_chunk)
-        if self._answer_started or final_text:
-            response_chunk = self._set_task(_RESPONSE_TASK_ID, status="complete")
-            if response_chunk is not None:
-                chunks.append(response_chunk)
-        return chunks or None
+    def _limit_title(self, text: str) -> str:
+        one_line = " ".join(text.split())
+        if len(one_line) <= _TITLE_LIMIT:
+            return one_line
+        return one_line[: _TITLE_LIMIT - 1].rstrip() + "…"
 
     def _limit_detail(self, text: str) -> str:
         if len(text) <= _DETAIL_LIMIT:
             return text
         return text[: _DETAIL_LIMIT - 1].rstrip() + "…"
+
+    def _limit_detail_tail(self, text: str) -> str:
+        """Keep the freshest tail of `text` within the detail cap (rolling window)."""
+        if len(text) <= _DETAIL_LIMIT:
+            return text
+        return "…" + text[-(_DETAIL_LIMIT - 1) :].lstrip()
+
+    # ------------------------------------------------------------------ fallback
+
+    async def _send_fallback(self, final_text: str | None) -> None:
+        rendered = self._render_fallback(final_text)
+        if rendered:
+            await send_rich(
+                self._client,
+                self._channel_id,
+                rendered,
+                SlackSendOpts(thread_ts=self._thread_ts),
+            )
 
     def _render_fallback(self, final_text: str | None) -> str:
         sections: list[str] = []
@@ -401,9 +539,21 @@ class SlackStreamEditor:
             if label:
                 sections.append(f"💭 *{label}*")
 
+        if self._used_tools:
+            summary = self._tool_summary()
+            if summary:
+                sections.append(summary)
+
         if answer:
             sections.append(answer)
 
         if not sections:
             sections.append("…")
         return "\n\n".join(sections).strip()
+
+    def _tool_summary(self) -> str:
+        details = self._tool_details()
+        if not details:
+            return ""
+        header = f"🔧 *Tools used* ({self._tool_count})" if self._tool_count else "🔧 *Tools used*"
+        return f"{header}\n{details}"

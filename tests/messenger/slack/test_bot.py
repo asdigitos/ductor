@@ -860,75 +860,44 @@ class TestMessageRouting:
             task_display_mode="plan",
             buffer_size=64,
         )
-        assert any(
-            "💭 *Thinking*" in call.kwargs.get("markdown_text", "")
+        # Option A: reasoning never reaches the message body — only the answer does.
+        markdown_writes = [
+            call.kwargs.get("markdown_text", "")
             for call in streamer.append.await_args_list
-        )
-        chunk_batches = [
-            call.kwargs["chunks"]
+            if call.kwargs.get("markdown_text")
+        ]
+        assert markdown_writes == ["final"]
+        assert all("💭 *Thinking*" not in md for md in markdown_writes)
+        # Gather every plan/task chunk across the append stream and the final stop.
+        all_chunks = [
+            chunk
             for call in streamer.append.await_args_list
             if call.kwargs.get("chunks")
+            for chunk in call.kwargs["chunks"]
         ]
-        assert chunk_batches[0][0] == {"type": "plan_update", "title": "Working on your request"}
-        assert [chunk["id"] for chunk in chunk_batches[0][1:]] == ["analyze", "tools", "respond"]
-        assert chunk_batches[0][1]["status"] == "in_progress"
-        assert chunk_batches[0][2]["status"] == "pending"
-        assert chunk_batches[0][3]["status"] == "pending"
-        assert chunk_batches[1] == [
-            {
-                "type": "task_update",
-                "id": "analyze",
-                "title": "Understand request",
-                "status": "complete",
-                "details": "step 1",
-            },
-            {
-                "type": "task_update",
-                "id": "tools",
-                "title": "Use tools if needed",
-                "status": "in_progress",
-                "details": "- Search: slack thinking steps ai agents",
-            },
-        ]
-        assert chunk_batches[2] == [
-            {
-                "type": "task_update",
-                "id": "tools",
-                "title": "Use tools if needed",
-                "status": "in_progress",
-                "details": (
-                    "- Search: slack thinking steps ai agents\n"
-                    "- Web fetch: slack.dev/slack-thinking-steps-ai-agents"
-                ),
-            }
-        ]
-        assert chunk_batches[3] == [
-            {
-                "type": "task_update",
-                "id": "tools",
-                "title": "Use tools if needed",
-                "status": "complete",
-                "details": (
-                    "- Search: slack thinking steps ai agents\n"
-                    "- Web fetch: slack.dev/slack-thinking-steps-ai-agents"
-                ),
-            },
-            {
-                "type": "task_update",
-                "id": "respond",
-                "title": "Draft response",
-                "status": "in_progress",
-            },
-        ]
+        all_chunks += list(streamer.stop.await_args.kwargs.get("chunks") or [])
+
+        plan_updates = [c for c in all_chunks if c["type"] == "plan_update"]
+        assert len(plan_updates) == 1
+        assert plan_updates[0]["title"] == "Working on your request"
+
+        def statuses(task_id: str) -> list[str]:
+            return [c["status"] for c in all_chunks if c.get("id") == task_id]
+
+        assert statuses("analyze")[0] == "in_progress"
+        assert statuses("analyze")[-1] == "complete"
+        assert "step 1" in [c.get("details") for c in all_chunks if c.get("id") == "analyze"]
+
+        # Each tool call is its own row (full record), not folded into one "tools" task.
+        assert all(c.get("id") != "tools" for c in all_chunks)
+        titles = {c["id"]: c["title"] for c in all_chunks if str(c.get("id", "")).startswith("tool-")}
+        assert titles["tool-1"] == "Search: slack thinking steps ai agents"
+        assert titles["tool-2"] == "Web fetch: slack.dev/slack-thinking-steps-ai-agents"
+        assert statuses("tool-1")[-1] == "complete"
+        assert statuses("tool-2")[-1] == "complete"
+
+        assert statuses("respond")[-1] == "complete"
         streamer.stop.assert_awaited_once()
-        assert streamer.stop.await_args.kwargs["chunks"] == [
-            {
-                "type": "task_update",
-                "id": "respond",
-                "title": "Draft response",
-                "status": "complete",
-            }
-        ]
 
     async def test_run_streaming_in_dm_omits_recipient_context(self) -> None:
         bot = _make_bot()
@@ -948,10 +917,11 @@ class TestMessageRouting:
             recipient_user_id="U123",
         )
 
+        # No callbacks fired → no plan activity, so the bare turn streams a plain
+        # message (no task_display_mode). In a DM, recipient context is omitted.
         bot._app.client.chat_stream.assert_awaited_once_with(
             channel="D123",
             thread_ts="1710000000.123",
-            task_display_mode="plan",
             buffer_size=64,
         )
 
