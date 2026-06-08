@@ -51,12 +51,14 @@ try:
         AsyncSocketModeHandler as _SlackSocketModeHandler,
     )
     from slack_bolt.async_app import AsyncApp as _SlackAsyncApp
+    from slack_sdk.errors import SlackApiError as _SlackApiError
 
     _SLACK_AVAILABLE = True
 except ImportError:  # pragma: no cover - import fallback
     _SLACK_AVAILABLE = False
     _SlackSocketModeHandler = object
     _SlackAsyncApp = object
+    _SlackApiError = Exception  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -1550,8 +1552,25 @@ class SlackBot:
         if not channels:
             logger.warning("Slack broadcast: no channels available, message lost: %s", text[:80])
             return
+        failures: list[tuple[str, str]] = []
         for channel_id in channels:
-            await self._send_rich(channel_id, text)
+            try:
+                await self._send_rich(channel_id, text)
+            except _SlackApiError as exc:
+                err = (exc.response or {}).get("error", "unknown") if hasattr(exc, "response") else "unknown"
+                failures.append((channel_id, err))
+                logger.warning(
+                    "Slack broadcast: skipping channel=%s error=%s (continuing with remaining channels)",
+                    channel_id,
+                    err,
+                )
+        if failures:
+            logger.warning(
+                "Slack broadcast: %d/%d channel(s) failed: %s",
+                len(failures),
+                len(channels),
+                ", ".join(f"{ch}={err}" for ch, err in failures),
+            )
 
     async def notify_startup(self, text: str) -> None:
         await self._notification_service.notify_all(text)
